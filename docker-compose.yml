@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  docker-agent:
+    build: .
+    image: appleberryd/dockermonitor:latest
+    container_name: docker-monitor-agent
+    restart: unless-stopped
+    ports:
+      - "9876:9876"
+    volumes:
+      # Mount Docker socket - this is what gives us access to Docker
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Optional: Mount for disk stats of host
+      - /:/host:ro
+    environment:
+      - AGENT_PORT=9876
+      - AGENT_AUTH_TOKEN=${AGENT_AUTH_TOKEN?required}
+      - AGENT_ALLOWED_ORIGIN=${AGENT_ALLOWED_ORIGIN:-}
+    # Security: Only allow necessary capabilities
+    security_opt:
+      - no-new-privileges:true
+    # Read-only filesystem except for /tmp
+    read_only: true
+    tmpfs:
+      - /tmp
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: '0.5'
+        reservations:
+          memory: 32M
+          cpus: '0.1'
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9876/agent/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    labels:
+      - "com.docker-monitor.agent=true"
+      - "com.docker-monitor.version=1.0.0"
+
+networks:
+  default:
+    name: docker-monitor-network

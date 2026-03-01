@@ -1,32 +1,25 @@
 # Docker Monitor Agent
 
-A lightweight Docker API proxy agent that provides secure access to Docker operations without exposing the Docker daemon directly.
+A lightweight Docker API proxy agent that provides token-authenticated access to Docker monitoring and container management endpoints.
 
-## The Problem
+## Current Release (March 2026)
 
-Docker Monitor (and similar apps) traditionally require you to expose the Docker daemon over TCP, which involves:
+- Current published image tag: `appleberryd/dockermonitor-agent:0.1.1`
+- Default listen port: `9876`
+- Auth mode: `AGENT_AUTH_TOKEN` required by default
+- Public endpoint without auth: `/agent/health`
+- Protected endpoints (bearer auth required): Docker API proxy routes and `/agent/stats`
 
-1. Modifying `/etc/docker/daemon.json` to enable TCP socket
-2. Restarting the Docker daemon
-3. Opening firewall ports (2375/2376)
-4. Managing TLS certificates for secure connections
-5. **Security risk**: Full Docker API access to anyone who can reach the port
+Notes:
 
-```json
-// The OLD way - modifying daemon.json (DON'T DO THIS)
-{
-  "hosts": ["unix:///var/run/docker.sock", "tcp://0.0.0.0:2376"],
-  "tls": true,
-  "tlscert": "/path/to/server-cert.pem",
-  "tlskey": "/path/to/server-key.pem"
-}
-```
+1. Use the pinned `0.1.1` tag for production stability.
+2. Do not assume `latest` exists in the registry.
 
-## The Solution
+## Overview
 
 This agent runs as a container that:
 
-- **Requires ZERO Docker daemon configuration changes**
+- **Requires no Docker daemon configuration changes**
 - Accesses Docker via the Unix socket (already available)
 - Exposes only the specific API endpoints needed
 - Provides additional system metrics (CPU, memory, disk)
@@ -61,7 +54,7 @@ This agent runs as a container that:
 git clone <repo>
 cd docker-agent
 export AGENT_AUTH_TOKEN="$(openssl rand -hex 32)"
-docker-compose up -d
+docker compose up -d
 ```
 
 ### Option 2: Docker Build & Run
@@ -73,31 +66,42 @@ docker build -t docker-monitor-agent .
 # Run the container
 docker run -d \
   --name docker-monitor-agent \
+  --restart unless-stopped \
   -p 9876:9876 \
   -e AGENT_AUTH_TOKEN="<your-random-token>" \
   -v /var/run/docker.sock:/var/run/docker.sock:ro \
   -v /:/host:ro \
-  --restart unless-stopped \
+  --security-opt no-new-privileges:true \
+  --read-only \
+  --tmpfs /tmp \
+  --memory 128m \
+  --cpus 0.5 \
   docker-monitor-agent
 ```
 
 ### Option 3: One-Line Deploy Script
 
 ```bash
-# Download and run the deploy script
-curl -fsSL https://raw.githubusercontent.com/your-org/docker-agent/main/deploy.sh | bash
+# Run the repo deploy script from this directory
+export AGENT_AUTH_TOKEN="$(openssl rand -hex 32)"
+./deploy.sh deploy
 ```
 
-### Option 4: Pre-built Image (when published)
+### Option 4: Pre-built Image (current tag)
 
 ```bash
 docker run -d \
   --name docker-monitor-agent \
+  --restart unless-stopped \
   -p 9876:9876 \
   -e AGENT_AUTH_TOKEN="<your-random-token>" \
   -v /var/run/docker.sock:/var/run/docker.sock:ro \
   -v /:/host:ro \
-  --restart unless-stopped \
+  --security-opt no-new-privileges:true \
+  --read-only \
+  --tmpfs /tmp \
+  --memory 128m \
+  --cpus 0.5 \
   appleberryd/dockermonitor-agent:0.1.1
 ```
 
@@ -112,6 +116,9 @@ curl http://localhost:9876/agent/health
 
 # Test Docker connection
 curl -H "Authorization: Bearer <AGENT_AUTH_TOKEN>" http://localhost:9876/version
+
+# Auth check (expected: 401 Unauthorized)
+curl http://localhost:9876/version
 ```
 
 ## Configuration
@@ -182,7 +189,7 @@ The agent provides a REST API that mirrors the Docker Engine API for the endpoin
 
 ## System Stats Endpoint
 
-The `/agent/stats` endpoint provides comprehensive host system metrics that aren't available through the standard Docker API:
+The `/agent/stats` endpoint provides comprehensive host system metrics for dashboard and health monitoring:
 
 ```bash
 curl -H "Authorization: Bearer <AGENT_AUTH_TOKEN>" http://localhost:9876/agent/stats | jq
@@ -311,7 +318,7 @@ docker run -d \
 ## Building from Source
 
 ### Prerequisites
-- Go 1.21 or later
+- Go 1.23 or later
 - Docker (for building the image)
 
 ### Local Development
@@ -401,30 +408,33 @@ curl http://localhost:9876/containers/json | jq
 curl "http://localhost:9876/containers/<container_id>/stats?stream=false" | jq
 ```
 
-## Comparison: Agent vs Direct Docker API
-
-| Feature | Direct Docker API | Docker Agent |
-|---------|-------------------|--------------|
-| Daemon config changes | Required | None |
-| Docker restart needed | Yes | No |
-| TLS certificate management | Required | Optional (via proxy) |
-| System stats (CPU/RAM/Disk) | Limited | Full |
-| Attack surface | Full Docker API | Limited endpoints |
-| Easy to remove | Daemon config revert | `docker rm` |
-| Resource overhead | None | ~10MB RAM |
-
 ## Updating the Agent
 
 ```bash
-# Pull latest image
-docker pull docker-monitor-agent:latest
+IMAGE="appleberryd/dockermonitor-agent:0.1.1"
+TOKEN="<your-existing-token>"
+
+# Pull target image tag
+docker pull "$IMAGE"
 
 # Stop and remove old container
 docker stop docker-monitor-agent
 docker rm docker-monitor-agent
 
-# Run new version
-docker-compose up -d
+# Run updated version
+docker run -d \
+  --name docker-monitor-agent \
+  --restart unless-stopped \
+  -p 9876:9876 \
+  -e AGENT_AUTH_TOKEN="$TOKEN" \
+  -v /var/run/docker.sock:/var/run/docker.sock:ro \
+  -v /:/host:ro \
+  --security-opt no-new-privileges:true \
+  --read-only \
+  --tmpfs /tmp \
+  --memory 128m \
+  --cpus 0.5 \
+  "$IMAGE"
 ```
 
 ## Uninstalling
@@ -438,7 +448,7 @@ docker rm docker-monitor-agent
 docker rmi docker-monitor-agent
 ```
 
-No daemon configuration to revert - you're done!
+Agent removed.
 
 ## License
 

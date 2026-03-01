@@ -1,0 +1,33 @@
+# Binaries
+docker-agent
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test files
+*_test.go
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+
+# Docker
+Dockerfile
+docker-compose*.yml
+.docker/
+
+# Documentation
+README.md
+LICENSE
+docs/
+
+# Build artifacts
+bin/
+dist/
