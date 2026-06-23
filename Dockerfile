@@ -1,49 +1,34 @@
-# Build stage
-FROM golang:1.23-alpine AS builder
+FROM golang:1.26.4-alpine AS builder
 
 WORKDIR /app
 
-# Install build dependencies and git (needed for go mod)
-RUN apk add --no-cache gcc musl-dev git
+RUN apk add --no-cache ca-certificates
 
-# Copy go mod file
-COPY go.mod ./
+COPY go.mod go.sum ./
+RUN go mod download
 
-# Copy source code first (needed for go mod tidy to resolve imports)
 COPY . .
 
-# Generate go.sum and download dependencies
-RUN go mod tidy && go mod download
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -trimpath \
+    -ldflags="-s -w -buildid=" \
+    -o /out/docker-agent .
 
-# Build the binary
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o docker-agent .
+RUN printf 'root:x:0:0:root:/root:/sbin/nologin\nnonroot:x:65532:65532:nonroot:/nonexistent:/sbin/nologin\n' > /out/passwd && \
+    printf 'root:x:0:\nnonroot:x:65532:\n' > /out/group
 
-# Final stage
-FROM alpine:3.19
+FROM scratch
 
-# Install ca-certificates for HTTPS and procps for system stats
-RUN apk add --no-cache ca-certificates procps
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=builder /out/passwd /etc/passwd
+COPY --from=builder /out/group /etc/group
+COPY --from=builder /out/docker-agent /docker-agent
 
-WORKDIR /app
-
-# Copy the binary from builder
-COPY --from=builder /app/docker-agent .
-
-# Create non-root user (but we'll still need docker socket access)
-RUN addgroup -g 1000 agent && \
-    adduser -D -u 1000 -G agent agent
-
-# The agent needs access to Docker socket, so we run as root
-# but the API itself is limited to specific operations
-USER root
-
-# Default port
 ENV AGENT_PORT=9876
 
 EXPOSE 9876
 
-# Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD wget --no-verbose --tries=1 --spider http://localhost:9876/agent/health || exit 1
+    CMD ["/docker-agent", "healthcheck"]
 
-ENTRYPOINT ["./docker-agent"]
+ENTRYPOINT ["/docker-agent"]

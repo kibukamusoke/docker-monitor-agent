@@ -11,11 +11,14 @@ set -e
 
 AGENT_NAME="docker-monitor-agent"
 AGENT_PORT="${AGENT_PORT:-9876}"
-AGENT_IMAGE="appleberryd/dockermonitor"
+AGENT_IMAGE="appleberryd/dockermonitor-agent"
 AGENT_TAG="${AGENT_TAG:-latest}"
 FULL_IMAGE="${AGENT_IMAGE}:${AGENT_TAG}"
+BUILDX_PLATFORMS="${BUILDX_PLATFORMS:-linux/amd64,linux/arm64}"
+PROVENANCE_MODE="${PROVENANCE_MODE:-max}"
 AGENT_ALLOWED_ORIGIN="${AGENT_ALLOWED_ORIGIN:-}"
 AGENT_AUTH_TOKEN="${AGENT_AUTH_TOKEN:-}"
+DOCKER_SOCKET_GID="${DOCKER_SOCKET_GID:-$(stat -c '%g' /var/run/docker.sock 2>/dev/null || echo 0)}"
 
 # Generate a token if not provided (secure-by-default deploy).
 if [ -z "$AGENT_AUTH_TOKEN" ]; then
@@ -33,18 +36,27 @@ COMMAND="${1:-deploy}"
 # Build function
 build_image() {
     echo "=== Building Docker Monitor Agent ==="
-    docker build -t "$FULL_IMAGE" -t "${AGENT_IMAGE}:latest" .
+    docker buildx build \
+        --load \
+        --provenance="mode=${PROVENANCE_MODE}" \
+        --sbom=true \
+        -t "$FULL_IMAGE" \
+        -t "${AGENT_IMAGE}:latest" \
+        .
     echo "✅ Built: $FULL_IMAGE"
 }
 
 # Push function
 push_image() {
     echo "=== Pushing to Docker Hub ==="
-    docker push "$FULL_IMAGE"
-    if [ "$AGENT_TAG" != "latest" ]; then
-        docker push "${AGENT_IMAGE}:latest"
-        docker buildx build --platform linux/amd64,linux/arm64 -t "${AGENT_IMAGE}:0.1.1" --push .
-    fi
+    docker buildx build \
+        --platform "$BUILDX_PLATFORMS" \
+        --provenance="mode=${PROVENANCE_MODE}" \
+        --sbom=true \
+        -t "$FULL_IMAGE" \
+        -t "${AGENT_IMAGE}:latest" \
+        --push \
+        .
     echo "✅ Pushed: $FULL_IMAGE"
 }
 
@@ -55,12 +67,10 @@ case "$COMMAND" in
         exit 0
         ;;
     push)
-        build_image
         push_image
         exit 0
         ;;
     all)
-        build_image
         push_image
         # Continue to deploy
         ;;
@@ -101,7 +111,12 @@ docker pull "$FULL_IMAGE" || {
     echo "Could not pull image. Building locally..."
     # If we can't pull, try to build from local Dockerfile
     if [ -f "Dockerfile" ]; then
-        docker build -t "$FULL_IMAGE" .
+        docker buildx build \
+            --load \
+            --provenance="mode=${PROVENANCE_MODE}" \
+            --sbom=true \
+            -t "$FULL_IMAGE" \
+            .
     else
         echo "Error: No Dockerfile found and image pull failed"
         exit 1
@@ -118,12 +133,14 @@ docker run -d \
     -e "AGENT_ALLOWED_ORIGIN=${AGENT_ALLOWED_ORIGIN}" \
     -v /var/run/docker.sock:/var/run/docker.sock:ro \
     -v /:/host:ro \
+    --user 65532:65532 \
+    --group-add "$DOCKER_SOCKET_GID" \
     --security-opt no-new-privileges:true \
     --read-only \
     --tmpfs /tmp \
     --memory 128m \
     --cpus 0.5 \
-    --health-cmd "wget --no-verbose --tries=1 --spider http://localhost:9876/agent/health || exit 1" \
+    --health-cmd "/docker-agent healthcheck" \
     --health-interval 30s \
     --health-timeout 10s \
     --health-retries 3 \

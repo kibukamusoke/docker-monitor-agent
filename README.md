@@ -2,9 +2,22 @@
 
 A lightweight Docker API proxy agent that provides token-authenticated access to Docker monitoring and container management endpoints.
 
+Docker Monitor Agent is the server-side component used by the Docker Monitor mobile app. It runs as a normal container on your Docker host, reads Docker through the local Unix socket, and exposes only the endpoints the app needs for mobile monitoring and container operations. There is no cloud relay and no Docker daemon TCP configuration required.
+
+## Trust Model
+
+- **Local Docker access only:** the agent talks to `/var/run/docker.sock` inside the host.
+- **Bearer-token auth:** every Docker and stats endpoint requires `Authorization: Bearer <AGENT_AUTH_TOKEN>`.
+- **Narrow unauthenticated surface:** only `/agent/health` is public for liveness checks.
+- **No cloud dependency:** the agent does not call Docker Monitor servers.
+- **No telemetry:** the agent does not collect or transmit analytics.
+- **Hardened recommended deployment:** the image keeps a root-compatible default for existing users, while the recommended deployment uses `--user 65532:65532`, `--group-add` for Docker socket access, `--read-only`, `--security-opt no-new-privileges:true`, memory/CPU limits, and a read-only Docker socket mount.
+
+Read [SECURITY.md](SECURITY.md) before exposing the agent outside a trusted network.
+
 ## Current Release (March 2026)
 
-- Current published image tag: `appleberryd/dockermonitor-agent:0.1.1`
+- Current published image tag: `appleberryd/dockermonitor-agent:0.1.2`
 - Default listen port: `9876`
 - Auth mode: `AGENT_AUTH_TOKEN` required by default
 - Public endpoint without auth: `/agent/health`
@@ -12,7 +25,7 @@ A lightweight Docker API proxy agent that provides token-authenticated access to
 
 Notes:
 
-1. Use the pinned `0.1.1` tag for production stability.
+1. Use the pinned `0.1.2` tag for production stability.
 2. Do not assume `latest` exists in the registry.
 
 ## Overview
@@ -48,16 +61,46 @@ This agent runs as a container that:
 
 ## Quick Start
 
-### Option 1: Docker Compose (Recommended)
+### Option 1: Pre-built Image (Recommended)
+
+```bash
+TOKEN="$(openssl rand -hex 32)"
+SOCK_GID="$(stat -c '%g' /var/run/docker.sock)"
+IMAGE="appleberryd/dockermonitor-agent:0.1.2"
+
+docker rm -f docker-monitor-agent >/dev/null 2>&1 || true
+docker run -d \
+  --name docker-monitor-agent \
+  --restart unless-stopped \
+  -p 9876:9876 \
+  -e AGENT_AUTH_TOKEN="$TOKEN" \
+  -v /var/run/docker.sock:/var/run/docker.sock:ro \
+  -v /:/host:ro \
+  --user 65532:65532 \
+  --group-add "$SOCK_GID" \
+  --security-opt no-new-privileges:true \
+  --read-only \
+  --tmpfs /tmp \
+  --memory 128m \
+  --cpus 0.5 \
+  "$IMAGE"
+
+echo "AGENT_AUTH_TOKEN=$TOKEN"
+```
+
+Use the printed token in Docker Monitor when adding the server.
+
+### Option 2: Docker Compose
 
 ```bash
 git clone <repo>
 cd docker-agent
 export AGENT_AUTH_TOKEN="$(openssl rand -hex 32)"
+export DOCKER_SOCKET_GID="$(stat -c '%g' /var/run/docker.sock)"
 docker compose up -d
 ```
 
-### Option 2: Docker Build & Run
+### Option 3: Docker Build & Run
 
 ```bash
 # Build the image
@@ -71,6 +114,8 @@ docker run -d \
   -e AGENT_AUTH_TOKEN="<your-random-token>" \
   -v /var/run/docker.sock:/var/run/docker.sock:ro \
   -v /:/host:ro \
+  --user 65532:65532 \
+  --group-add "$(stat -c '%g' /var/run/docker.sock)" \
   --security-opt no-new-privileges:true \
   --read-only \
   --tmpfs /tmp \
@@ -79,7 +124,7 @@ docker run -d \
   docker-monitor-agent
 ```
 
-### Option 3: One-Line Deploy Script
+### Option 4: One-Line Deploy Script
 
 ```bash
 # Run the repo deploy script from this directory
@@ -87,7 +132,7 @@ export AGENT_AUTH_TOKEN="$(openssl rand -hex 32)"
 ./deploy.sh deploy
 ```
 
-### Option 4: Pre-built Image (current tag)
+### Option 5: Pre-built Image (expanded)
 
 ```bash
 docker run -d \
@@ -97,12 +142,14 @@ docker run -d \
   -e AGENT_AUTH_TOKEN="<your-random-token>" \
   -v /var/run/docker.sock:/var/run/docker.sock:ro \
   -v /:/host:ro \
+  --user 65532:65532 \
+  --group-add "$(stat -c '%g' /var/run/docker.sock)" \
   --security-opt no-new-privileges:true \
   --read-only \
   --tmpfs /tmp \
   --memory 128m \
   --cpus 0.5 \
-  appleberryd/dockermonitor-agent:0.1.1
+  appleberryd/dockermonitor-agent:0.1.2
 ```
 
 ## Verify It's Running
@@ -120,6 +167,23 @@ curl -H "Authorization: Bearer <AGENT_AUTH_TOKEN>" http://localhost:9876/version
 # Auth check (expected: 401 Unauthorized)
 curl http://localhost:9876/version
 ```
+
+## Required Mounts
+
+| Mount | Mode | Why it exists |
+|---|---:|---|
+| `/var/run/docker.sock:/var/run/docker.sock:ro` | read-only | Allows the agent to talk to Docker Engine without enabling Docker TCP. Docker still authorizes container operations through this socket, so protect agent access carefully. |
+| `/:/host:ro` | read-only | Allows `/agent/stats` to report host disk and filesystem metrics. Remove this mount if you only need Docker API proxying and not host-level disk stats. |
+
+## Network Guidance
+
+The safest deployment is one of:
+
+1. Keep port `9876` reachable only on a private network or VPN.
+2. Do not publish the port publicly; connect through Docker Monitor's SSH tunnel support.
+3. If public exposure is unavoidable, put the agent behind HTTPS and firewall source IPs where possible.
+
+Never run without `AGENT_AUTH_TOKEN` outside local testing.
 
 ## Configuration
 
@@ -342,12 +406,23 @@ go build -o docker-agent .
 ### Build Docker Image
 
 ```bash
-# Standard build
-docker build -t docker-monitor-agent .
+# Local test build
+docker buildx build --load \
+  --provenance=mode=max \
+  --sbom=true \
+  -t docker-monitor-agent .
 
-# Multi-platform build
-docker buildx build --platform linux/amd64,linux/arm64 -t docker-monitor-agent .
+# Release build for Docker Hub with full provenance and SBOM attestations
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  --provenance=mode=max \
+  --sbom=true \
+  -t appleberryd/dockermonitor-agent:0.1.2 \
+  -t appleberryd/dockermonitor-agent:latest \
+  --push .
 ```
+
+The pushed registry image is what Docker Scout checks for provenance and SBOM attestations.
 
 ## Troubleshooting
 
@@ -381,8 +456,8 @@ netstat -tlnp | grep 9876
 # Check agent logs
 docker logs docker-monitor-agent
 
-# Test Docker connection manually
-docker exec docker-monitor-agent wget -qO- http://localhost:9876/version
+# Run the built-in healthcheck manually
+docker exec docker-monitor-agent /docker-agent healthcheck
 ```
 
 ### Permission denied errors
@@ -394,9 +469,17 @@ The agent needs access to the Docker socket. Ensure:
 ls -la /var/run/docker.sock
 # Should show: srw-rw---- 1 root docker ...
 
+# Pass the socket group into the recommended non-root container
+SOCK_GID="$(stat -c '%g' /var/run/docker.sock)"
+docker run ... --user 65532:65532 --group-add "$SOCK_GID" ...
+
 # If using rootless Docker, the socket location may differ
 # Check DOCKER_HOST environment variable
 ```
+
+### Portainer says `unable to find user root`
+
+This was caused by the hardened `scratch` image not having a `root` passwd entry. Newer builds include a minimal passwd/group file for backward compatibility. For the hardened setup, remove the `root` override, use `65532:65532`, and add the Docker socket group in the container groups setting.
 
 ### Container stats returning empty
 
@@ -411,8 +494,9 @@ curl "http://localhost:9876/containers/<container_id>/stats?stream=false" | jq
 ## Updating the Agent
 
 ```bash
-IMAGE="appleberryd/dockermonitor-agent:0.1.1"
+IMAGE="appleberryd/dockermonitor-agent:0.1.2"
 TOKEN="<your-existing-token>"
+SOCK_GID="$(stat -c '%g' /var/run/docker.sock)"
 
 # Pull target image tag
 docker pull "$IMAGE"
@@ -429,6 +513,8 @@ docker run -d \
   -e AGENT_AUTH_TOKEN="$TOKEN" \
   -v /var/run/docker.sock:/var/run/docker.sock:ro \
   -v /:/host:ro \
+  --user 65532:65532 \
+  --group-add "$SOCK_GID" \
   --security-opt no-new-privileges:true \
   --read-only \
   --tmpfs /tmp \

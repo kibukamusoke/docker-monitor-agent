@@ -14,12 +14,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/api/types/volume"
-	"github.com/docker/docker/client"
 	"github.com/gorilla/mux"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/api/types/volume"
+	"github.com/moby/moby/client"
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/disk"
 	"github.com/shirou/gopsutil/v3/mem"
@@ -33,6 +32,11 @@ var (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
+		runHealthcheck()
+		return
+	}
+
 	var err error
 	dockerClient, err = client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
@@ -43,7 +47,7 @@ func main() {
 	// Test connection
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, err = dockerClient.Ping(ctx)
+	_, err = dockerClient.Ping(ctx, client.PingOptions{NegotiateAPIVersion: true})
 	if err != nil {
 		log.Fatalf("Failed to connect to Docker daemon: %v", err)
 	}
@@ -96,6 +100,24 @@ func main() {
 
 	log.Printf("Docker Agent starting on port %s", port)
 	log.Fatal(http.ListenAndServe(":"+port, corsMiddleware(authMiddleware(router))))
+}
+
+func runHealthcheck() {
+	port := os.Getenv("AGENT_PORT")
+	if port == "" {
+		port = "9876"
+	}
+
+	client := http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get("http://127.0.0.1:" + port + "/agent/health")
+	if err != nil {
+		log.Fatalf("healthcheck failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Fatalf("healthcheck failed: status %d", resp.StatusCode)
+	}
 }
 
 func corsMiddleware(next http.Handler) http.Handler {
@@ -162,12 +184,12 @@ func listContainers(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	all := r.URL.Query().Get("all") == "true"
-	containers, err := dockerClient.ContainerList(ctx, types.ContainerListOptions{All: all})
+	result, err := dockerClient.ContainerList(ctx, client.ContainerListOptions{All: all})
 	if err != nil {
 		errorResponse(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	jsonResponse(w, containers)
+	jsonResponse(w, result.Items)
 }
 
 func inspectContainer(w http.ResponseWriter, r *http.Request) {
@@ -175,12 +197,12 @@ func inspectContainer(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	id := mux.Vars(r)["id"]
-	containerJSON, err := dockerClient.ContainerInspect(ctx, id)
+	result, err := dockerClient.ContainerInspect(ctx, id, client.ContainerInspectOptions{})
 	if err != nil {
 		errorResponse(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	jsonResponse(w, containerJSON)
+	jsonResponse(w, result.Container)
 }
 
 func startContainer(w http.ResponseWriter, r *http.Request) {
@@ -188,7 +210,7 @@ func startContainer(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	id := mux.Vars(r)["id"]
-	err := dockerClient.ContainerStart(ctx, id, types.ContainerStartOptions{})
+	_, err := dockerClient.ContainerStart(ctx, id, client.ContainerStartOptions{})
 	if err != nil {
 		errorResponse(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -201,7 +223,7 @@ func stopContainer(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	id := mux.Vars(r)["id"]
-	err := dockerClient.ContainerStop(ctx, id, container.StopOptions{})
+	_, err := dockerClient.ContainerStop(ctx, id, client.ContainerStopOptions{})
 	if err != nil {
 		errorResponse(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -214,7 +236,7 @@ func restartContainer(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	id := mux.Vars(r)["id"]
-	err := dockerClient.ContainerRestart(ctx, id, container.StopOptions{})
+	_, err := dockerClient.ContainerRestart(ctx, id, client.ContainerRestartOptions{})
 	if err != nil {
 		errorResponse(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -233,7 +255,7 @@ func renameContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err := dockerClient.ContainerRename(ctx, id, name)
+	_, err := dockerClient.ContainerRename(ctx, id, client.ContainerRenameOptions{NewName: name})
 	if err != nil {
 		errorResponse(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -247,7 +269,7 @@ func removeContainer(w http.ResponseWriter, r *http.Request) {
 
 	id := mux.Vars(r)["id"]
 	force := r.URL.Query().Get("force") == "true"
-	err := dockerClient.ContainerRemove(ctx, id, types.ContainerRemoveOptions{Force: force})
+	_, err := dockerClient.ContainerRemove(ctx, id, client.ContainerRemoveOptions{Force: force})
 	if err != nil {
 		errorResponse(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -265,7 +287,7 @@ func getContainerLogs(w http.ResponseWriter, r *http.Request) {
 		tail = "100"
 	}
 
-	options := types.ContainerLogsOptions{
+	options := client.ContainerLogsOptions{
 		ShowStdout: r.URL.Query().Get("stdout") != "false",
 		ShowStderr: r.URL.Query().Get("stderr") != "false",
 		Tail:       tail,
@@ -290,7 +312,7 @@ func getContainerStats(w http.ResponseWriter, r *http.Request) {
 	id := mux.Vars(r)["id"]
 	stream := r.URL.Query().Get("stream") != "false"
 
-	stats, err := dockerClient.ContainerStats(ctx, id, stream)
+	stats, err := dockerClient.ContainerStats(ctx, id, client.ContainerStatsOptions{Stream: stream})
 	if err != nil {
 		errorResponse(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -302,7 +324,7 @@ func getContainerStats(w http.ResponseWriter, r *http.Request) {
 		io.Copy(w, stats.Body)
 	} else {
 		// For non-streaming, read and return single stats snapshot
-		var statsJSON types.StatsJSON
+		var statsJSON container.StatsResponse
 		decoder := json.NewDecoder(stats.Body)
 		if err := decoder.Decode(&statsJSON); err != nil {
 			errorResponse(w, err.Error(), http.StatusInternalServerError)
@@ -333,7 +355,12 @@ func createContainer(w http.ResponseWriter, r *http.Request) {
 		name = config.Name // Backward compatibility for older clients.
 	}
 
-	resp, err := dockerClient.ContainerCreate(ctx, &config.Config, &config.HostConfig, &config.NetworkingConfig, nil, name)
+	resp, err := dockerClient.ContainerCreate(ctx, client.ContainerCreateOptions{
+		Config:           &config.Config,
+		HostConfig:       &config.HostConfig,
+		NetworkingConfig: &config.NetworkingConfig,
+		Name:             name,
+	})
 	if err != nil {
 		errorResponse(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -349,12 +376,12 @@ func listImages(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	images, err := dockerClient.ImageList(ctx, types.ImageListOptions{All: true})
+	result, err := dockerClient.ImageList(ctx, client.ImageListOptions{All: true})
 	if err != nil {
 		errorResponse(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	jsonResponse(w, images)
+	jsonResponse(w, result.Items)
 }
 
 func pullImage(w http.ResponseWriter, r *http.Request) {
@@ -372,7 +399,7 @@ func pullImage(w http.ResponseWriter, r *http.Request) {
 		fullImage = imageName + ":" + tag
 	}
 
-	reader, err := dockerClient.ImagePull(ctx, fullImage, types.ImagePullOptions{})
+	reader, err := dockerClient.ImagePull(ctx, fullImage, client.ImagePullOptions{})
 	if err != nil {
 		errorResponse(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -393,7 +420,7 @@ func removeImage(w http.ResponseWriter, r *http.Request) {
 	id := mux.Vars(r)["id"]
 	force := r.URL.Query().Get("force") == "true"
 
-	_, err := dockerClient.ImageRemove(ctx, id, types.ImageRemoveOptions{Force: force})
+	_, err := dockerClient.ImageRemove(ctx, id, client.ImageRemoveOptions{Force: force})
 	if err != nil {
 		errorResponse(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -407,7 +434,7 @@ func getVersion(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 
-	version, err := dockerClient.ServerVersion(ctx)
+	version, err := dockerClient.ServerVersion(ctx, client.ServerVersionOptions{})
 	if err != nil {
 		errorResponse(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -419,36 +446,36 @@ func getInfo(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 
-	info, err := dockerClient.Info(ctx)
+	result, err := dockerClient.Info(ctx, client.InfoOptions{})
 	if err != nil {
 		errorResponse(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	jsonResponse(w, info)
+	jsonResponse(w, result.Info)
 }
 
 func listNetworks(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 
-	networks, err := dockerClient.NetworkList(ctx, types.NetworkListOptions{})
+	result, err := dockerClient.NetworkList(ctx, client.NetworkListOptions{})
 	if err != nil {
 		errorResponse(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	jsonResponse(w, networks)
+	jsonResponse(w, result.Items)
 }
 
 func listVolumes(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 
-	volumes, err := dockerClient.VolumeList(ctx, volume.ListOptions{})
+	result, err := dockerClient.VolumeList(ctx, client.VolumeListOptions{})
 	if err != nil {
 		errorResponse(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	jsonResponse(w, volumes)
+	jsonResponse(w, volume.ListResponse{Volumes: result.Items, Warnings: result.Warnings})
 }
 
 // Agent-specific handlers for enhanced system stats
@@ -715,7 +742,8 @@ func getSystemStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Disk stats - try Docker data root first, then fall back to root filesystem
-	dockerInfo, _ := dockerClient.Info(ctx)
+	dockerInfoResult, _ := dockerClient.Info(ctx, client.InfoOptions{})
+	dockerInfo := dockerInfoResult.Info
 	diskPath := "/"
 	if dockerInfo.DockerRootDir != "" {
 		diskPath = dockerInfo.DockerRootDir
@@ -762,7 +790,7 @@ func healthCheck(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	_, err := dockerClient.Ping(ctx)
+	_, err := dockerClient.Ping(ctx, client.PingOptions{})
 	if err != nil {
 		errorResponse(w, "Docker daemon unreachable: "+err.Error(), http.StatusServiceUnavailable)
 		return

@@ -31,3 +31,6 @@ docs/
 # Build artifacts
 bin/
 dist/
+
+# Scripts
+push.sh
